@@ -1,0 +1,99 @@
+---
+title: "ToD Correspondence Analysis"
+author: "Isaac Amouzou"
+date: "2025-01-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries and set up
+
+```{r}
+library(data.table)
+library(tidytable)
+library(duckdb)
+library(arrow)
+library(glue)
+library(MASS)
+
+us_airport_stations_lat_lon <- read.csv("us_airport_stations_lat_lon.csv")
+
+#this contains the lat/lon as well as the airport identification codes
+flight_airport_data <- read.csv("T_MASTER_CORD.csv") %>% distinct(AIRPORT_ID, AIRPORT, .keep_all = TRUE)
+
+Base <- "C:/Users/Isaac/OneDrive - George Mason University - O365 Production/ASA/Data Challange 2024/data-expo-2024/"
+```
+```{r}
+
+#this function should return the row that has the closest lat and lon
+find_closest <- function(lat, lon, secondarydf, column) {
+  distances <- (secondarydf$LATITUDE - lat)^2 + (secondarydf$LONGITUDE - lon)^2
+  
+  closest_index <- which.min(distances)  
+  
+  return(secondarydf[[column]][closest_index]) 
+}
+closest_matches <- us_airport_stations_lat_lon %>%
+  rowwise() %>% 
+  mutate(airport = find_closest(LAT, LONG, flight_airport_data, "AIRPORT"))
+```
+
+
+#Pull data
+```{r}
+
+#May need to run gc() here
+
+con <- dbConnect(duckdb::duckdb())
+
+#only the years 2010-2024 will be examined
+file_paths <- paste0("'",Base,"Data/Year=", 2019:2024, "/data_0.parquet'", collapse = ", ")
+
+variables <- c("Year", "CRSDepTime","DepDelayMinutes", "DepartureDelayGroups",
+  "Origin", "OriginCityName", "OriginState",
+  "Dest", "DestCityName", "DestState",
+  "CarrierDelay","WeatherDelay","SecurityDelay","LateAircraftDelay",
+  "Reporting_Airline", "Year", "Quarter", "Month", "DayofMonth",
+  "DayOfWeek", "Cancelled", "CancellationCode", "Diverted",
+)
+
+query <- glue("
+SELECT {paste(variables, collapse = ', ')}
+FROM read_parquet([ {file_paths} ])
+WHERE {paste(paste0(variables, ' IS NOT NULL'), collapse = ' AND ')}
+")
+
+result_arrow <- dbGetQuery(con, query, arrow = TRUE)
+gc()
+#we are interested in only flights that are delayed
+df <-  as.data.table(result_arrow)
+rm(result_arrow)
+gc()
+```
+
+Due to the massive dataset, an the analysis currently being at an exploratory stage, only 100,000 rows will be considered. Further, seeing as 15 minutes is not too long, only delays of 30+ minutes will be considered 
+```{r}
+#Only examining delayed flights
+filtered_df <- df %>% filter(DepartureDelayGroups >= 1)
+rm(df)
+gc()
+str(filtered_df)
+```
+
+```{r}
+hist(filtered_df$DepDelayMinutes)
+```
+```{r}
+table(filtered_df$DepartureDelayGroups)
+```
+
+Create flight ("Origin->Dest") variable, set DeparetureDelayGroups to chr
+```{r}
+filtered_df <- filtered_df %>%
+  mutate(flight = paste0(Origin,"->",Dest),
+         DepartureDelayGroups  = as.character(DepartureDelayGroups))
+head(filtered_df)
+```

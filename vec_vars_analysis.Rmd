@@ -1,0 +1,758 @@
+---
+title: "Untitled"
+author: 'Isaac Amouzou G#: G01307253'
+date: "2025-04-15"
+output: html_document
+---
+
+```{r}
+set.seed(490)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+gc()
+rm(list=ls())
+# for data management
+
+library(data.table)
+library(tidytable)
+library(duckdb)
+library(arrow)
+library(glue)
+library(lubridate)
+```
+
+```{r}
+Base <- "C:/Users/Isaac/OneDrive - George Mason University - O365 Production/ASA/Data Challange 2024/data-expo-2024/"
+flight_airport_data <- read.csv("T_MASTER_CORD.csv") %>% distinct(AIRPORT_ID, AIRPORT, .keep_all = TRUE)
+```
+
+```{r}
+airport_timezones <- flight_airport_data %>%
+  distinct(AIRPORT, .keep_all = TRUE) %>%
+  mutate(
+    tz = lutz::tz_lookup_coords(LATITUDE, LONGITUDE, method = "accurate")
+  ) %>%
+  distinct(AIRPORT, .keep_all = TRUE) %>%  
+  dplyr::select(AIRPORT, tz)
+```
+
+```{r}
+con <- dbConnect(duckdb::duckdb())
+
+file_paths <- paste0("'",Base,"Data/Year=", 2018:2024, "/data_0.parquet'", collapse = ", ")
+
+variables <- c("FlightDate", "CRSDepTime","DepDelayMinutes", "DepartureDelayGroups",
+  "Origin")
+
+query <- glue("
+SELECT {paste(variables, collapse = ', ')}
+FROM read_parquet([ {file_paths} ])
+WHERE {paste(paste0(variables, ' IS NOT NULL'), collapse = ' AND ')}
+")
+
+result_arrow <- dbGetQuery(con, query, arrow = TRUE)
+gc()
+
+df <-  as.data.table(result_arrow)
+rm(result_arrow)
+gc()
+```
+
+```{r}
+top_50_iata <- c("ATL", "LAX", "DFW", "DEN", "ORD", "JFK", "MCO", "LAS", "CLT", "MIA",
+                 "SEA", "EWR", "SFO", "PHX", "IAH", "BOS", "FLL", "MSP", "LGA", "DTW",
+                 "PHL", "SLC", "BWI", "DCA", "SAN", "IAD", "TPA", "BNA", "AUS", "MDW",
+                 "HNL", "DAL", "PDX", "STL", "RDU", "HOU", "SMF", "MSY", "SJU", "SJC",
+                 "SNA", "MCI", "OAK", "SAT", "RSW", "CLE", "IND", "PIT", "CVG", "CMH")
+```
+
+
+```{r}
+filtered_df1 <- df %>% 
+  filter(Origin %in% top_50_iata) %>%
+  mutate(CRSDepTime = as.numeric(CRSDepTime))
+```
+
+```{r}
+dim(filtered_df1)
+head(filtered_df1)
+```
+
+```{r}
+updated_flights <- filtered_df1 %>%
+  left_join(airport_timezones, by = c("Origin" = "AIRPORT"))
+```
+
+
+#(DELETE LATER) test with just flights connetced to DCA (a decent amount of times)
+
+```{r}
+rm(df)
+gc()
+```
+```{r}
+flights_with_est <- updated_flights %>%
+  mutate(
+    hour = floor(CRSDepTime / 100),
+    minute = CRSDepTime %% 100,
+    local_time = make_datetime(year = year(FlightDate), month = month(FlightDate),
+                               day = day(FlightDate), hour = hour, min = minute, tz = tz),
+    est_time = with_tz(local_time, tzone = "America/New_York"),
+  ) %>% tidytable::select(-hour, -minute, -local_time)
+```
+
+```{r}
+rm(updated_flights)
+rm(filtered_df1)
+gc()
+```
+
+
+```{r}
+get_delay_table <- function(data) {
+  data %>%
+    mutate(
+      TimeKey = paste0(
+        format(est_time, "%Y-%m-%d"),
+        "-",
+        sprintf("%02d", hour(est_time))
+      )
+    ) %>%
+    group_by(TimeKey, Origin) %>%
+    summarise(
+      NumDelays = sum(DepDelayMinutes >= 15, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = Origin,
+      values_from = NumDelays,
+      values_fill = 0
+    )
+}
+```
+
+```{r}
+delay.table <- get_delay_table(flights_with_est)
+```
+
+```{r}
+dim(delay.table)
+```
+
+```{r}
+# for analysis
+library(urca)
+library(vars)
+```
+
+
+```{r}
+delay_matrix <- delay.table %>% 
+  tidytable::select(-TimeKey) %>% 
+  as.matrix()
+
+rm(delay.table)
+gc()
+```
+
+Check if airports are stationary
+```{r}
+adf_tests <- apply(delay_matrix, 2, function(x) ur.df(x,
+                                                      lags=6,
+                                                      type = "trend",
+                                                      selectlags = "AIC"))
+adf_results <- lapply(adf_tests, summary)
+```
+
+```{r}
+(lagdata <- VARselect(delay_matrix, lag.max = 20, type = "const"))
+```
+```{r}
+p <- 6 # at 6 lags the metrics are relitively well minimized
+
+train <- 365*24*6
+
+train_data <- delay_matrix[1:train, ]
+```
+
+
+```{r}
+var_model <- VAR(train_data,
+                 p = p,
+                 type = "const")
+```
+
+
+
+```{r}
+ahead <- 96
+
+test_data  <- delay_matrix[(train+1):(train+ahead),]
+
+forecast_result <- predict(var_model, n.ahead = ahead)
+
+rmses <- numeric(20)
+
+for (h in 1:ahead) {
+  pred_vector   <- sapply(forecast_result$fcst, function(x) x[h, "fcst"])
+  actual_vector <- as.numeric(test_data[h, ])
+  rmses[h] <- mean((pred_vector - actual_vector)^2)**0.5
+}
+```
+
+
+```{r}
+plot(rmses,
+     xlab="hours ahead",
+     main=glue("rmses of airport forecasts till 4 days (96 hours) ahead  \n mean rmse: {mean(rmses)}"))
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+fevd_result <- fevd(var_model, n.ahead = 25)
+
+DCA_fevd <- fevd_result$DCA
+airport_names <- colnames(DCA_fevd)
+
+dca_index <- which(airport_names == "DCA")
+
+fevd_df <- data.frame(
+  Horizon = 1:nrow(DCA_fevd),
+  DCA = DCA_fevd[, dca_index],
+  Others = rowSums(DCA_fevd[, -dca_index])
+)
+
+fevd_long <- pivot_longer(fevd_df, cols = c("DCA", "Others"),
+                          names_to = "Source", values_to = "Variance")
+
+ggplot(fevd_long, aes(x = Horizon, y = Variance, fill = Source)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "FEVD for DCA: Own vs Other Airports",
+       y = "Forecast Error Variance Share",
+       x = "Forecast Horizon") +
+  scale_fill_manual(values = c("DCA" = "#1f77b4", "Others" = "#ff7f0e")) +
+  theme_minimal()
+```
+
+
+```{r}
+
+common_top_contributer <- character(20)
+
+for (i in 1:20) {
+ 
+  sorted_names <- names(sort(DCA_fevd[i, ], decreasing = TRUE))
+  common_top_contributer[i] <- sorted_names[2] # 2 as DCA itself will generally be #1
+}
+
+table(common_top_contributer)
+
+```
+
+```{r}
+(start.fitting <- Sys.time())
+top_contributer<- names(which.max(table(common_top_contributer)))
+
+plot(irf(var_model, impulse = top_contributer, response = "DCA", 
+         boot = TRUE, cumulative = FALSE, n.ahead = 15, ci = 0.95, runs = 50))
+(end.fitting <- Sys.time())
+```
+```{r}
+end.fitting - start.fitting
+```
+
+Delay propogation simulation
+
+
+```{r}
+p <- var_model$p
+k <- ncol(train_data)
+coefs <- Bcoef(var_model)  
+const <- coefs[,"const" ]  
+
+coefs_no_const <- coefs[, colnames(coefs) != "const", drop = FALSE]
+
+Coef_Lag_List <- lapply(1:p, function(i) {
+  col_start <- (i - 1) * k + 1
+  col_end   <- i * k
+  coefs_no_const[, col_start:col_end, drop = FALSE]
+})
+```
+
+
+```{r}
+simulate_propagation <- function(Coef_Lag_List, const, initial_history, horizon = 20) {
+  p <- length(Coef_Lag_List)    
+  k <- ncol(initial_history)     
+  results <- matrix(NA, nrow = horizon, ncol = k)
+  colnames(results) <- colnames(initial_history)
+
+  history <- initial_history    
+
+  for (h in 1:horizon) {
+    
+    next_row <- const
+    for (lag in 1:p) {
+      next_row <- next_row + Coef_Lag_List[[lag]] %*% history[p - lag + 1, ]
+    }
+
+    results[h, ] <- next_row
+    history <- rbind(history[-1, ], t(next_row))  # Slide window and append new row
+  }
+
+  return(results)
+}
+```
+
+Check simulation works properly
+
+```{r}
+test_matrix <- tail(train_data, p)
+spread_sim_test <- simulate_propagation(Coef_Lag_List, const, test_matrix, horizon = 20)
+
+predict_sim <- predict(var_model, n.ahead = 20)
+pred_matrix <- sapply(predict_sim$fcst, function(x) x[, "fcst"])
+
+summary(abs(spread_sim_test - pred_matrix))
+```
+Values are essentially the exact same - simulation works.
+
+```{r}
+ahead <- 24
+
+predict_sim <- predict(var_model, n.ahead = ahead)
+pred_matrix <- sapply(predict_sim$fcst, function(x) x[, "fcst"])
+
+shock_matrix <- test_matrix
+colnames(shock_matrix) <- colnames(train_data)
+shock_matrix[p, "DCA"] <- shock_matrix[p, "DCA"] + 10 # ten plus shock in the last hour
+
+spread_sim <- simulate_propagation(Coef_Lag_List, const, shock_matrix, horizon = ahead)
+```
+
+
+
+```{r}
+diff_matrix <- spread_sim - pred_matrix
+rownames(diff_matrix) <- 1:nrow(diff_matrix)
+
+diff_df <- as.data.frame(diff_matrix) %>%
+  mutate(Hour = row_number()) %>%
+  pivot_longer(-Hour, names_to = "Airport", values_to = "Difference")
+
+
+total_df <- diff_df %>%
+  group_by(Airport) %>%
+  summarise(TotalDelay = sum(Difference)) %>%
+  mutate(Label = ifelse(TotalDelay >= 0,
+                        paste0("+", round(TotalDelay, 1)),
+                        paste0(round(TotalDelay, 1))),
+         Hour = max(diff_df$Hour) + 1.5)
+
+diff_df$Airport <- factor(diff_df$Airport,
+                          levels = total_df$Airport[order(-total_df$TotalDelay)])
+total_df$Airport <- factor(total_df$Airport,
+                           levels = levels(diff_df$Airport))
+head(diff_df)
+head(total_df)
+```
+
+```{r}
+library(patchwork)
+library(scales)
+
+total_df$LabelColor <- ifelse(total_df$TotalDelay > 0, "red", "green")
+
+ggplot(diff_df, aes(x = Airport, y = Hour, fill = Difference)) +
+  geom_tile(color = "white") +
+  
+  # Label with color and horizontal padding
+  geom_text(
+    data = total_df,
+    aes(x = Airport, y = Hour, label = Label, color = LabelColor),
+    inherit.aes = FALSE,
+    size = 3.5, angle = 90, vjust = 0, hjust = 1.1  # shift slightly left
+  ) +
+  
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0,
+    name = "± Delay"
+  ) +
+  scale_color_identity() +
+  
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(1, 24, 4),
+    limits = c(max(diff_df$Hour) + 5, 1)
+  ) +
+  
+  # Add horizontal padding left/right
+  scale_x_discrete(
+    position = "top",
+    expand = expansion(add = c(2, 0.6))  # extra space on left/right
+  ) +
+  
+  labs(
+    title = glue("Simulated Impact of +10 Shock Delays In The Last Hour \n Across Airports over the next 24 hours"),
+    x = "Airport (Total ± Delay)", y = "Hour (Simulated Step)"
+  ) +
+  
+  theme_minimal(base_size = 12.25) +
+  theme(
+    axis.text.x.top = element_text(angle = 90, vjust = 0.5),
+    axis.text.x.bottom = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+For abstract:
+
+
+```{r}
+total_df$LabelColor <- ifelse(total_df$TotalDelay > 0, "red", "green")
+
+ggplot(diff_df, aes(x = Airport, y = Hour, fill = Difference)) +
+  geom_tile(color = "white") +
+  
+  # Label with color and horizontal padding
+  geom_text(
+    data = total_df,
+    aes(x = Airport, y = Hour, label = Label, color = LabelColor),
+    inherit.aes = FALSE,
+    size = 3.5, angle = 90, vjust = 0, hjust = 1.1  # shift slightly left
+  ) +
+  
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0,
+    name = "± Delay"
+  ) +
+  scale_color_identity() +
+  
+  scale_y_reverse(
+    expand = c(0, 0),
+    breaks = seq(1, 24, 4),
+    limits = c(max(diff_df$Hour) + 5, 1)
+  ) +
+  
+  # Add horizontal padding left/right
+  scale_x_discrete(
+    position = "top",
+    expand = expansion(add = c(2, 0.6))  # extra space on left/right
+  ) +
+  
+  labs(
+    title = glue("Simulated Impact of +10 Shock Delays In The Last Hour \n Across Airports over the next 24 hours"),
+    x = "Airport (Total ± Delay)", y = "Hour (Simulated Step)"
+  ) +
+  
+theme_minimal(base_size = 12.25) +
+theme(
+  axis.text.x.top = element_blank(),
+  axis.text.x.bottom = element_blank(),
+  axis.ticks.x = element_blank(),
+  axis.title.x = element_blank(),
+  panel.grid = element_blank(),
+  plot.title = element_text(hjust = 0.5)
+)
+```
+
+
+General FEVD:
+
+
+```{r}
+fevd_result <- fevd(var_model, n.ahead = 25)
+
+airport_names <- names(fevd_result)
+n_airports <- length(airport_names)
+horizon <- nrow(fevd_result[[1]])
+
+own_matrix <- matrix(0, nrow = horizon, ncol = n_airports)
+others_matrix <- matrix(0, nrow = horizon, ncol = n_airports)
+
+for (i in seq_along(airport_names)) {
+  fevd_matrix <- fevd_result[[i]]
+  own_matrix[, i] <- fevd_matrix[, i]  
+  others_matrix[, i] <- rowSums(fevd_matrix[, -i])  
+}
+
+fevd_df <- data.frame(
+  Horizon = 1:horizon,
+  Own = rowMeans(own_matrix),
+  Others = rowMeans(others_matrix)
+)
+
+fevd_long <- pivot_longer(fevd_df, cols = c("Own", "Others"),
+                          names_to = "Source", values_to = "Variance")
+
+fevd_long$Source <- factor(fevd_long$Source, levels = c("Own", "Others"))
+
+# Then plot
+ggplot(fevd_long, aes(x = Horizon, y = Variance, fill = Source)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Average FEVD: Own vs Other Airports",
+    y = "Average Forecast Error Variance Share",
+    x = "Forecast Horizon"
+  ) +
+  scale_fill_manual(values = c("Own" = "#1f77b4", "Others" = "#ff7f0e")) +
+  theme_minimal()
+
+```
+
+#influence of BOS on DCA,
+
+
+number of delays as outcome
+add number of flight as offset
+
+```{r}
+get_flight_count_table <- function(data) {
+  data %>%
+    mutate(
+      TimeKey = paste0(
+        format(est_time, "%Y-%m-%d"),
+        "-",
+        sprintf("%02d", hour(est_time))
+      )
+    ) %>%
+    group_by(TimeKey, Origin) %>%
+    summarise(NumFlights = n(), .groups = "drop") %>%
+    pivot_wider(
+      names_from = Origin,
+      values_from = NumFlights,
+      values_fill = 0
+    ) %>%
+    rename_with(
+      ~ paste0(.x, "_flight_count"),
+      .cols = -TimeKey
+    )
+}
+
+```
+
+```{r}
+flight_count_matrix <- get_flight_count_table(flights_with_est) %>%
+  dplyr::select(-TimeKey) %>%
+  as.matrix(.)
+```
+
+```{r}
+#rm(flights_with_est)
+gc()
+```
+
+```{r}
+train <- 365*24
+train_data <- delay_matrix[1:train, ]
+train_exogen <- flight_count_matrix[1:train, ]
+```
+
+
+```{r}
+var_model_exogen <- VAR(y=train_data,
+                 exogen = train_exogen,
+                 p = p,
+                 type = "const")
+```
+
+```{r}
+ahead <- 96
+
+test_data  <- delay_matrix[(train+1):(train+ahead),]
+
+forecast_result <- predict(
+  var_model_exogen,
+  n.ahead = ahead,
+  dumvar = flight_count_matrix[(train+1):(train+ahead),]
+)
+
+rmses <- numeric(20)
+
+for (h in 1:ahead) {
+  pred_vector   <- sapply(forecast_result$fcst, function(x) x[h, "fcst"])
+  actual_vector <- as.numeric(test_data[h, ])
+  rmses[h] <- mean((pred_vector - actual_vector)^2)**0.5
+}
+```
+
+```{r}
+plot(rmses,
+     xlab="hours ahead",
+     main=glue("rmses of airport forecasts till 4 days (96 hours) ahead  \n with airport count \n mean rmse: {mean(rmses)}"))
+```
+
+```{r}
+p <- var_model_exogen$p
+k <- ncol(train_data)
+coefs <- Bcoef(var_model_exogen)  
+const <- coefs[, "const"]
+
+coefs_no_const <- coefs[, colnames(coefs) != "const", drop = FALSE]
+lag_coef_cols <- (p * k)
+Coef_Lag_List <- lapply(1:p, function(i) {
+  col_start <- (i - 1) * k + 1
+  col_end <- i * k
+  coefs_no_const[, col_start:col_end, drop = FALSE]
+})
+Coef_Exog <- coefs_no_const[, (lag_coef_cols + 1):ncol(coefs_no_const), drop = FALSE]
+```
+
+Check simulation:
+
+```{r}
+simulate_propagation_exog <- function(Coef_Lag_List, Coef_Exog, const, initial_history, future_exog, horizon = 20) {
+  p <- length(Coef_Lag_List)
+  k <- ncol(initial_history)
+  results <- matrix(NA, nrow = horizon, ncol = k)
+  colnames(results) <- colnames(initial_history)
+
+  history <- initial_history
+
+  for (h in 1:horizon) {
+    next_row <- const
+    for (lag in 1:p) {
+      next_row <- next_row + Coef_Lag_List[[lag]] %*% history[p - lag + 1, ]
+    }
+    next_row <- next_row + Coef_Exog %*% future_exog[h, ]
+    results[h, ] <- next_row
+    history <- rbind(history[-1, ], t(next_row))
+  }
+
+  return(results)
+}
+```
+
+```{r}
+test_matrix <- tail(train_data, p)
+future_exogen_test <- flight_count_matrix[(train+1):(train+20),]
+
+spread_sim_exogen_test <- simulate_propagation_exog(Coef_Lag_List, Coef_Exog, const, test_matrix, future_exogen_test, horizon = 20)
+
+predict_sim <- predict(var_model_exogen,
+                       dumvar=future_exogen_test,
+                       n.ahead = 20)
+pred_matrix <- sapply(predict_sim$fcst, function(x) x[, "fcst"])
+
+summary(abs(spread_sim_exogen_test - pred_matrix))
+```
+
+```{r}
+ahead <- 24
+
+future_exogen <- flight_count_matrix[(train+1):(train+ahead),]
+
+predict_sim <- predict(var_model_exogen,
+                       n.ahead = ahead,
+                       dumvar=future_exogen)
+
+pred_matrix <- sapply(predict_sim$fcst, function(x) x[, "fcst"])
+
+shock_matrix_exogen <- future_exogen
+colnames(shock_matrix_exogen) <- colnames(future_exogen_test)
+
+
+shock_matrix_exogen[, "DCA_flight_count"] <- pmax(shock_matrix_exogen[, "DCA_flight_count"] - 67.8/ahead,0)  # about 50 less flights in the next 24 hr
+
+spread_sim_exogen <- simulate_propagation_exog(Coef_Lag_List, Coef_Exog, const, test_matrix, shock_matrix_exogen, horizon = ahead)
+```
+
+```{r}
+sum(future_exogen[, "DCA_flight_count"]) - sum(shock_matrix_exogen[, "DCA_flight_count"])
+```
+50 less flights
+
+```{r}
+diff_matrix <- spread_sim_exogen - pred_matrix
+rownames(diff_matrix) <- 1:nrow(diff_matrix)
+
+diff_df <- as.data.frame(diff_matrix) %>%
+  mutate(Hour = row_number()) %>%
+  pivot_longer(-Hour, names_to = "Airport", values_to = "Difference")
+
+
+total_df <- diff_df %>%
+  group_by(Airport) %>%
+  summarise(TotalDelay = sum(Difference)) %>%
+  mutate(Label = ifelse(TotalDelay >= 0,
+                        paste0("+", round(TotalDelay, 1)),
+                        paste0(round(TotalDelay, 1))),
+         Hour = max(diff_df$Hour) + 1.5)
+
+diff_df$Airport <- factor(diff_df$Airport,
+                          levels = total_df$Airport[order(-total_df$TotalDelay)])
+total_df$Airport <- factor(total_df$Airport,
+                           levels = levels(diff_df$Airport))
+head(diff_df)
+head(total_df)
+```
+```{r}
+ggplot(diff_df, aes(x = Airport, y = Hour, fill = Difference)) +
+  geom_tile(color = "white") +
+  
+  # Label with color and horizontal padding
+  geom_text(
+    data = total_df,
+    aes(x = Airport, y = Hour, label = Label, color = LabelColor),
+    inherit.aes = FALSE,
+    size = 3.5, angle = 90, vjust = 0, hjust = 1.1  # shift slightly left
+  ) +
+  
+  scale_fill_gradient2(
+    low = "blue", mid = "white", high = "red", midpoint = 0,
+    name = "± Delay"
+  ) +
+  scale_color_identity() +
+  
+  scale_y_reverse(
+    expand = c(0, 0),
+    limits = c(max(diff_df$Hour) + 5, 1)
+  ) +
+  
+  # Add horizontal padding left/right
+  scale_x_discrete(
+    position = "top",
+    expand = expansion(add = c(2, 0.6))  # extra space on left/right
+  ) +
+  
+  labs(
+    title = glue("Simulated Impact of 50 Fewer Flights at DCA (Over Next 24 Hours) \n On Delays Across Airports (Over Next 24 Hours)"),
+    x = "Airport (Total ± Delay)", y = "Hour (Simulated Step)"
+  ) +
+  
+  theme_minimal(base_size = 12.25) +
+  theme(
+    axis.text.x.top = element_text(angle = 90, vjust = 0.5),
+    axis.text.x.bottom = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+
+
+```{r}
+end.fitting - start.fitting
+```
+
+
+#### TODO shou FEVD for airports on average with others
+
+#### Simulation to effect of shock at one airport on others and expected delays, plot grid maybe
+
+#### same as above but do with flight count model, and maybe show how a slight decrease in flights can decrease the number of delays
+
+#### Finally find how to interpret IRF!!!

@@ -1,0 +1,131 @@
+---
+title: "noaa-processer"
+author: "Isaac Amouzou"
+date: "2025-02-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(httr2)
+```
+
+```{r}
+
+#Any keywords that a weather station at an airport would ahve
+
+airport_keywords <- c("INTL", "INTERNATIONAL", "AP",
+                      "AIRPORT", "AEROPORT", "AERO",
+                      "ARP", "TERMINAL", "AIR",
+                      "TERMINAL", "INT'L", "GATEWAY",
+                      "RUNWAY", "RGNL", "INT", "INT'L",
+                      "ARP", "NATIONAL", "REGIONAL", "IN")
+
+
+us_airport_stations <- read_csv("Data/noaa_stations/ghcnd-stations.csv", 
+         col_select = c(1, 6), 
+         col_names = FALSE,
+         col_types = "cc") %>%
+  rename(STATIONID = X1, STATION=X6) %>%
+  filter(str_starts(STATIONID, "US")) %>%
+  filter(str_detect(STATION, regex(str_c("\\b", airport_keywords, "\\b", collapse = "|"),
+                                   ignore_case = TRUE)))
+dim(us_airport_stations) #1117 stations found
+```
+
+```{r}
+
+# Define file paths
+data_dir <- "Data/noaa_stations/noaa-yearly-GHCND"
+
+for (year in 2015:2024) {
+  
+  # Define file paths for the year
+  file_path <- file.path(data_dir, paste0(year, ".csv.gz"))
+  output_dir <- file.path(data_dir, as.character(year))  # Directory for each year
+  
+  # Check if file exists before processing
+  if (!file.exists(file_path)) {
+    print(paste(year, "data file not found. Skipping..."))
+    next
+  }
+  
+  # Create directory if it doesn’t exist
+  if (!dir.exists(output_dir)) dir.create(output_dir)
+  
+  # Read the NOAA data for the year
+  ghcn_data <- read_csv(file_path, col_names = FALSE)
+  
+  # Assign correct column names based on NOAA readme
+  colnames(ghcn_data) <- c("STATION", "DATE", "ELEMENT", "VALUE", "M_FLAG", "Q_FLAG", "S_FLAG", "OBS_TIME")
+  
+  # Convert DATE column to standard format (YYYY-MM-DD)
+  ghcn_data <- ghcn_data %>%
+    mutate(DATE = ymd(DATE))  # Converts YYYYMMDD to YYYY-MM-DD
+  
+  # Initialize counters
+  stations_saved <- 0
+  stations_not_found <- 0
+  
+  # Process each station separately
+  for (station_id in us_airport_stations$STATIONID) {
+    
+    # Filter data for the station
+    station_data <- ghcn_data %>%
+      filter(STATION == station_id)
+    
+    # Define output file path
+    station_file <- file.path(output_dir, paste0(station_id, "_", year, ".csv"))
+    
+    # Save to CSV if data exists
+    if (nrow(station_data) > 0) {
+      write_csv(station_data, station_file)
+      stations_saved <- stations_saved + 1
+    } else {
+      stations_not_found <- stations_not_found + 1
+    }
+  }
+  
+  # Print summary for the year
+  print(paste(year, "Processing Complete"))
+  print(paste("Stations saved:", stations_saved))
+  print(paste("Stations not found:", stations_not_found))
+  print("")  # New line for readability
+  gc()
+  gc()
+}
+
+print("Processing for all years complete.")
+```
+```{r}
+us_airport_stations_lat_lon <- read_csv("Data/noaa_stations/ghcnd-stations.csv", 
+         col_select = c(1,2,3, 6), 
+         col_names = FALSE,
+         col_types = "cc") %>%
+  rename(STATIONID = X1,
+         LAT=X2,
+         LONG=X3, 
+         STATION=X6) %>%
+  filter(str_starts(STATIONID, "US")) %>%
+  filter(str_detect(STATION, regex(str_c("\\b", airport_keywords, "\\b", collapse = "|"),
+                                   ignore_case = TRUE)))
+
+#use as mapping for lat and lon as subsets
+#write.csv(us_airport_stations_lat_lon, "us_airport_stations_lat_lon.csv") 
+```
+```{r}
+us_airport_stations_lat_lon
+```
+
+
+
+
+
+
+
+
